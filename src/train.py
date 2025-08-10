@@ -8,12 +8,20 @@ import pandas as pd
 import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnRewardThreshold
+from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 import matplotlib.pyplot as plt
 from environment import create_environment
 import warnings
 warnings.filterwarnings('ignore')
+
+# Detect tensorboard availability
+try:
+    import tensorboard  # noqa: F401
+    _TB_AVAILABLE = True
+except Exception:
+    _TB_AVAILABLE = False
 
 def setup_training_environment(train_data_path, eval_data_path=None):
     """
@@ -28,34 +36,43 @@ def setup_training_environment(train_data_path, eval_data_path=None):
     """
     print("Setting up training environment...")
     
-    # Create training environment
-    train_env = create_environment(
-        train_data_path,
-        initial_balance=100000,
-        lookback_window=30,
-        transaction_cost=0.001,
-        risk_free_rate=0.02
-    )
-    
-    # Wrap in Monitor for logging
-    train_env = Monitor(train_env, filename='../results/training_log.csv', allow_early_resets=True)
+    # Create vectorized training environment
+    def make_train_env():
+        env = create_environment(
+            train_data_path,
+            initial_balance=100000,
+            lookback_window=30,
+            transaction_cost=0.001,
+            risk_free_rate=0.02,
+            turnover_penalty=0.05,
+        )
+        return Monitor(env, filename='../results/training_log.csv', allow_early_resets=True)
+
+    train_env = DummyVecEnv([make_train_env])
+    train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
     
     # Create evaluation environment if eval data is provided
     eval_env = None
     if eval_data_path and os.path.exists(eval_data_path):
         print("Setting up evaluation environment...")
-        eval_env = create_environment(
-            eval_data_path,
-            initial_balance=100000,
-            lookback_window=30,
-            transaction_cost=0.001,
-            risk_free_rate=0.02
-        )
-        eval_env = Monitor(eval_env, filename='../results/eval_log.csv', allow_early_resets=True)
+        def make_eval_env():
+            env = create_environment(
+                eval_data_path,
+                initial_balance=100000,
+                lookback_window=30,
+                transaction_cost=0.001,
+                risk_free_rate=0.02,
+                turnover_penalty=0.05,
+            )
+            return Monitor(env, filename='../results/eval_log.csv', allow_early_resets=True)
+
+        eval_env = DummyVecEnv([make_eval_env])
+        # Create VecNormalize for eval, do not update stats; we will sync obs_rms from train
+        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
     
     return train_env, eval_env
 
-def create_ppo_model(env, learning_rate=3e-4, n_steps=2048, batch_size=64, 
+def create_ppo_model(env, learning_rate=1e-4, n_steps=4096, batch_size=256, 
                      n_epochs=10, gamma=0.99, verbose=1):
     """
     Create and configure PPO model
@@ -92,7 +109,7 @@ def create_ppo_model(env, learning_rate=3e-4, n_steps=2048, batch_size=64,
         use_sde=False,
         sde_sample_freq=-1,
         target_kl=None,
-        tensorboard_log="../results/tensorboard/",
+        tensorboard_log=("../results/tensorboard/" if _TB_AVAILABLE else None),
         policy_kwargs=dict(
             net_arch=[dict(pi=[256, 256], vf=[256, 256])]
         ),
@@ -115,9 +132,9 @@ def setup_callbacks(eval_env, eval_freq=5000, n_eval_episodes=10):
         list: List of callbacks
     """
     callbacks = []
-    
+
     if eval_env is not None:
-        # Evaluation callback
+        # Evaluation callback only (no early stopping)
         eval_callback = EvalCallback(
             eval_env,
             best_model_save_path='../models/',
@@ -128,14 +145,7 @@ def setup_callbacks(eval_env, eval_freq=5000, n_eval_episodes=10):
             render=False
         )
         callbacks.append(eval_callback)
-    
-    # Stop training when reward threshold is reached
-    reward_threshold_callback = StopTrainingOnRewardThreshold(
-        reward_threshold=0.5,  # Adjust based on your reward scale
-        verbose=1
-    )
-    callbacks.append(reward_threshold_callback)
-    
+
     return callbacks
 
 def train_agent(total_timesteps=100000, save_path='../models/ppo_spy_gld'):
@@ -159,6 +169,9 @@ def train_agent(total_timesteps=100000, save_path='../models/ppo_spy_gld'):
         '../data/train_data.csv',
         '../data/test_data.csv'
     )
+    # If using VecNormalize for eval, sync observation statistics
+    if eval_env is not None and hasattr(train_env, 'obs_rms') and hasattr(eval_env, 'obs_rms'):
+        eval_env.obs_rms = train_env.obs_rms
     
     # Create model
     model = create_ppo_model(train_env)
@@ -178,6 +191,13 @@ def train_agent(total_timesteps=100000, save_path='../models/ppo_spy_gld'):
     
     # Save the final model
     model.save(save_path)
+    # Save VecNormalize statistics for inference/backtest
+    try:
+        if hasattr(train_env, 'save'):
+            train_env.save('../models/vecnormalize.pkl')
+            print('Saved VecNormalize stats to ../models/vecnormalize.pkl')
+    except Exception as e:
+        print(f"Warning: could not save VecNormalize stats: {e}")
     print(f"Training completed! Model saved to {save_path}.zip")
     
     return model
@@ -244,7 +264,7 @@ def main():
     
     try:
         # Train the agent
-        model = train_agent(total_timesteps=50000)  # Adjust as needed
+        model = train_agent(total_timesteps=500000)  # Increased for better performance
         
         # Plot training progress
         plot_training_progress()

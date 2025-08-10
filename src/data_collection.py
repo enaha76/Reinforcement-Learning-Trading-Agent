@@ -31,14 +31,28 @@ def download_stock_data(tickers, start_date="2005-01-01", end_date=None):
     for ticker in tickers:
         print(f"Downloading {ticker}...")
         stock = yf.Ticker(ticker)
-        hist = stock.history(start=start_date, end=end_date)
-        
+        hist = stock.history(start=start_date, end=end_date, actions=True)
+
+        # Reset index to make 'Date' a column before adding any new columns
+        hist = hist.reset_index()
+
+        # Ensure optional action columns exist (sometimes absent depending on data)
+        for col in ["Dividends", "Stock Splits"]:
+            if col not in hist.columns:
+                hist[col] = 0.0
+
         # Add ticker column
-        hist['Ticker'] = ticker
-        hist.reset_index(inplace=True)
-        
-        # Rename columns to be more descriptive
-        hist.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Dividends', 'Stock Splits', 'Ticker']
+        hist["Ticker"] = ticker
+
+        # Rename only specific columns to avoid length mismatches
+        hist = hist.rename(columns={"Adj Close": "Adj_Close", "Stock Splits": "Stock_Splits"})
+
+        # Optional: order columns if present
+        desired_order = [
+            "Date", "Open", "High", "Low", "Close", "Adj_Close",
+            "Volume", "Dividends", "Stock_Splits", "Ticker",
+        ]
+        hist = hist[[c for c in desired_order if c in hist.columns]]
         
         data_frames.append(hist)
         print(f"Downloaded {len(hist)} records for {ticker}")

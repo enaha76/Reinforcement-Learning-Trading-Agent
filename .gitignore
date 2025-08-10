@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.egg-info/
+.eggs/
+.dist/
+.build/
+.pytest_cache/
+.mypy_cache/
+.coverage*
+htmlcov/
+
+# OS / Editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Virtual environments
+venv/
+.venv/
+.env
+.env*/
+
+# Jupyter
+.notebook_checkpoints/
+**/.ipynb_checkpoints/
+
+# Project data and artifacts
+# Ignore large or generated files, keep placeholders and docs
+models/
+results/
+logs/
+runs/
+
+# Data directory (keep structure files)
+data/
+!data/.gitkeep
+!data/README.md
+
+# Checkpoints and serialized objects
+*.zip
+*.tar
+*.tar.gz
+*.pkl
+*.joblib
+*.npz
+
+# Cache
+.cache/
+
+# Matplotlib/plots cache
+**/figures/
+**/plots/
+
+# Local config
+*.local.json
+*.secret*

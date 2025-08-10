@@ -5,8 +5,8 @@ Based on FinRL framework with continuous action space
 
 import numpy as np
 import pandas as pd
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 from stable_baselines3.common.env_checker import check_env
 import warnings
 warnings.filterwarnings('ignore')
@@ -21,7 +21,9 @@ class TradingEnvironment(gym.Env):
     """
     
     def __init__(self, data, initial_balance=100000, lookback_window=30, 
-                 transaction_cost=0.001, risk_free_rate=0.02):
+                 transaction_cost=0.0005, risk_free_rate=0.02, turnover_penalty=0.05,
+                 max_allocation_change=0.10, drawdown_penalty=0.10,
+                 risk_lambda=0.15, primary_symbol='SPY', secondary_symbol='TLT'):
         """
         Initialize the trading environment
         
@@ -39,18 +41,48 @@ class TradingEnvironment(gym.Env):
         self.lookback_window = lookback_window
         self.transaction_cost = transaction_cost
         self.risk_free_rate = risk_free_rate
+        self.turnover_penalty = turnover_penalty
+        self.max_allocation_change = max_allocation_change
+        self.drawdown_penalty = drawdown_penalty
+        self.risk_lambda = risk_lambda
+        self.primary_symbol = primary_symbol
+        self.secondary_symbol = secondary_symbol
         
         # Ensure data is sorted by date
         self.data = self.data.sort_values('Date').reset_index(drop=True)
         
-        # Extract price columns for SPY and GLD
-        self.spy_prices = self.data['Close_SPY'].values
-        self.gld_prices = self.data['Close_GLD'].values
+        # Extract price columns based on symbols, fallback to GLD if secondary not found
+        primary_close_col = f'Close_{self.primary_symbol}'
+        secondary_close_col = f'Close_{self.secondary_symbol}'
+        if secondary_close_col not in self.data.columns:
+            # fallback
+            self.secondary_symbol = 'GLD'
+            secondary_close_col = 'Close_GLD'
+        self.spy_prices = self.data.get(primary_close_col, self.data['Close_SPY']).values
+        self.sec_prices = self.data.get(secondary_close_col, self.data.get('Close_TLT', self.data['Close_GLD'])).values
         
-        # Feature columns (excluding Date and Close prices)
-        self.feature_columns = [col for col in self.data.columns 
-                               if col not in ['Date', 'Close_SPY', 'Close_GLD']]
-        self.features = self.data[self.feature_columns].values
+        # Build/augment features safely (no leakage)
+        df = self.data.copy()
+        # Compute basic returns for primary/secondary
+        df['Ret_'+self.primary_symbol] = df[primary_close_col].pct_change()
+        df['Ret_'+self.secondary_symbol] = df[secondary_close_col].pct_change()
+        # Rolling stats on primary
+        df['Ret5_'+self.primary_symbol] = df['Ret_'+self.primary_symbol].rolling(5).sum()
+        df['Ret20_'+self.primary_symbol] = df['Ret_'+self.primary_symbol].rolling(20).sum()
+        df['Ret60_'+self.primary_symbol] = df['Ret_'+self.primary_symbol].rolling(60).sum()
+        df['Vol20_'+self.primary_symbol] = df['Ret_'+self.primary_symbol].rolling(20).std()
+        df['Vol60_'+self.primary_symbol] = df['Ret_'+self.primary_symbol].rolling(60).std()
+        df['MA200_'+self.primary_symbol] = df[primary_close_col].rolling(200).mean()
+        df['MA200Slope_'+self.primary_symbol] = df['MA200_'+self.primary_symbol].pct_change(5)
+        # Regime: vol percentile (approx via rank over 252)
+        df['VolPct_'+self.primary_symbol] = df['Vol20_'+self.primary_symbol].rolling(252).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x)>0 else 0.5, raw=False)
+        # Rolling correlation
+        df['Corr20'] = df['Ret_'+self.primary_symbol].rolling(20).corr(df['Ret_'+self.secondary_symbol])
+        
+        # Select features: keep existing plus new ones, excluding dates/prices
+        drop_cols = {'Date', primary_close_col, secondary_close_col}
+        self.feature_columns = [c for c in df.columns if c not in drop_cols]
+        self.features = df[self.feature_columns].values
         
         # Normalize features
         self.features = self._normalize_features(self.features)
@@ -86,21 +118,25 @@ class TradingEnvironment(gym.Env):
         
         return normalized_features
     
-    def reset(self):
-        """Reset the environment to initial state"""
+    def reset(self, *, seed: int | None = None, options: dict | None = None):
+        """Reset the environment to initial state (Gymnasium API)
+        Returns (observation, info)
+        """
+        super().reset(seed=seed)
         self.current_step = self.lookback_window
         self.balance = self.initial_balance
         self.spy_allocation = 0.5  # Start with 50-50 allocation
         self.gld_allocation = 0.5
-        
+
         # Portfolio tracking
         self.portfolio_values = [self.initial_balance]
         self.returns = []
         self.allocations = [(self.spy_allocation, self.gld_allocation)]
-        
+
         # Get initial state
-        state = self._get_state()
-        return state.astype(np.float32)
+        state = self._get_state().astype(np.float32)
+        info = {}
+        return state, info
     
     def _get_state(self):
         """
@@ -138,8 +174,13 @@ class TradingEnvironment(gym.Env):
         Returns:
             tuple: (next_state, reward, done, info)
         """
-        # Extract action
-        new_spy_allocation = np.clip(action[0], 0.0, 1.0)
+        # Extract action and limit turnover per step
+        target_spy_allocation = np.clip(float(action[0]), 0.0, 1.0)
+        # Cap how much allocation can change this step
+        delta = target_spy_allocation - self.spy_allocation
+        max_delta = float(self.max_allocation_change)
+        capped_delta = np.clip(delta, -max_delta, max_delta)
+        new_spy_allocation = float(np.clip(self.spy_allocation + capped_delta, 0.0, 1.0))
         new_gld_allocation = 1.0 - new_spy_allocation
         
         # Calculate transaction costs
@@ -159,11 +200,11 @@ class TradingEnvironment(gym.Env):
         # Calculate returns
         if self.current_step < len(self.spy_prices):
             spy_return = (self.spy_prices[self.current_step] - self.spy_prices[self.current_step - 1]) / self.spy_prices[self.current_step - 1]
-            gld_return = (self.gld_prices[self.current_step] - self.gld_prices[self.current_step - 1]) / self.gld_prices[self.current_step - 1]
+            sec_return = (self.sec_prices[self.current_step] - self.sec_prices[self.current_step - 1]) / self.sec_prices[self.current_step - 1]
             
             # Portfolio return
             portfolio_return = (old_spy_allocation * spy_return + 
-                              old_gld_allocation * gld_return)
+                              old_gld_allocation * sec_return)
             
             # Update balance
             self.balance = self.balance * (1 + portfolio_return) - transaction_cost
@@ -173,15 +214,18 @@ class TradingEnvironment(gym.Env):
             self.returns.append(portfolio_return)
             self.allocations.append((self.spy_allocation, self.gld_allocation))
         
-        # Calculate reward (Sharpe ratio-based)
+        # Calculate reward: relative return vs benchmark minus risk penalty
         reward = self._calculate_reward()
+        # Add turnover penalty to discourage frequent/all-or-nothing flips
+        reward -= float(self.turnover_penalty) * float(allocation_change)
         
-        # Check if episode is done
-        done = self.current_step >= self.max_steps or self.balance <= 0
-        
+        # Check termination/truncation conditions (Gymnasium API)
+        terminated = bool(self.balance <= 0)
+        truncated = bool(self.current_step >= self.max_steps)
+
         # Get next state
-        next_state = self._get_state()
-        
+        next_state = self._get_state().astype(np.float32)
+
         # Info dictionary
         info = {
             'balance': self.balance,
@@ -190,53 +234,44 @@ class TradingEnvironment(gym.Env):
             'portfolio_return': portfolio_return if self.current_step < len(self.spy_prices) else 0,
             'transaction_cost': transaction_cost
         }
-        
-        return next_state.astype(np.float32), reward, done, info
+
+        return next_state, reward, terminated, truncated, info
     
     def _calculate_reward(self):
+        """Composite reward to beat benchmark with risk-awareness.
+        reward = 0.5*excess_return + 0.3*portfolio_return + 0.1*sharpe_bonus - 0.1*abs(downside_penalty)
+        where excess_return = portfolio_return - SPY_return and sharpe over last 30 days.
         """
-        Calculate reward based on Sharpe ratio
-        
-        Returns:
-            float: Reward value
-        """
-        if len(self.returns) < 2:
+        if self.current_step == 0 or len(self.returns) < 1:
             return 0.0
         
-        # Calculate recent returns (last 30 days or available)
-        recent_returns = self.returns[-min(30, len(self.returns)):]
+        # One-step realized returns
+        portfolio_return = float(self.returns[-1])
+        spy_ret = float((self.spy_prices[self.current_step] - self.spy_prices[self.current_step - 1]) / self.spy_prices[self.current_step - 1])
+        excess_return = portfolio_return - spy_ret
         
-        if len(recent_returns) == 0:
-            return 0.0
+        # Downside penalty (heavier penalty on negative returns)
+        downside_penalty = min(0.0, portfolio_return) * 2.0
         
-        # Calculate Sharpe ratio
-        mean_return = np.mean(recent_returns)
-        std_return = np.std(recent_returns)
+        # 30-day Sharpe-like bonus (mean/std), numerically stable
+        if len(self.returns) >= 30:
+            window = np.array(self.returns[-30:], dtype=float)
+            mu = float(np.mean(window))
+            sigma = float(np.std(window))
+            sharpe_bonus = (mu / (sigma + 1e-8)) * 0.1
+        else:
+            sharpe_bonus = 0.0
         
-        if std_return == 0:
-            return mean_return * 100  # If no volatility, reward is just the return
-        
-        # Annualized Sharpe ratio (assuming daily returns)
-        daily_risk_free = self.risk_free_rate / 252
-        sharpe_ratio = (mean_return - daily_risk_free) / std_return * np.sqrt(252)
-        
-        # Scale reward to be more meaningful for RL
-        reward = sharpe_ratio / 10.0
-        
-        # Add penalty for extreme allocations to encourage diversification
-        allocation_penalty = 0
-        if self.spy_allocation < 0.1 or self.spy_allocation > 0.9:
-            allocation_penalty = -0.1
-        
-        return reward + allocation_penalty
-    
+        reward = 0.5 * excess_return + 0.3 * portfolio_return + 0.1 * sharpe_bonus + 0.1 * (-abs(downside_penalty))
+        return float(reward)
+
     def render(self, mode='human'):
         """Render the environment (optional)"""
         if mode == 'human':
             print(f"Step: {self.current_step}")
             print(f"Balance: ${self.balance:.2f}")
             print(f"SPY Allocation: {self.spy_allocation:.2%}")
-            print(f"GLD Allocation: {self.gld_allocation:.2%}")
+            print(f"Other Allocation: {self.gld_allocation:.2%}")
             if len(self.returns) > 0:
                 print(f"Last Return: {self.returns[-1]:.4f}")
             print("-" * 40)

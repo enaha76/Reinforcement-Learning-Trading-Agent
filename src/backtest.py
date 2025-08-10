@@ -9,6 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from environment import create_environment
 import warnings
 warnings.filterwarnings('ignore')
@@ -119,13 +120,31 @@ def run_agent_backtest(model_path, test_data_path, initial_balance=100000):
     print(f"Loading model from {model_path}")
     model = PPO.load(model_path)
     
-    # Create test environment
+    # Create test environment (vectorized with possible normalization)
     print("Creating test environment...")
-    env = create_environment(test_data_path, initial_balance=initial_balance)
-    
-    # Run backtest
-    print("Running agent backtest...")
-    obs = env.reset()
+    def make_test_env():
+        return create_environment(test_data_path, initial_balance=initial_balance)
+
+    stats_path = '../models/vecnormalize.pkl'
+    if os.path.exists(stats_path):
+        print("Loading VecNormalize stats for evaluation...")
+        venv = DummyVecEnv([make_test_env])
+        env = VecNormalize.load(stats_path, venv)
+        env.training = False
+        env.norm_reward = False
+        # Set env to model for consistency
+        try:
+            model.set_env(env)
+        except Exception:
+            pass
+        # VecEnv API: reset returns obs only
+        obs = env.reset()
+        using_vec = True
+    else:
+        print("VecNormalize stats not found, evaluating without normalization.")
+        env = create_environment(test_data_path, initial_balance=initial_balance)
+        obs, _info = env.reset()
+        using_vec = False
     portfolio_values = [initial_balance]
     returns = []
     allocations = []
@@ -137,10 +156,17 @@ def run_agent_backtest(model_path, test_data_path, initial_balance=100000):
     while not done:
         # Get action from trained agent
         action, _ = model.predict(obs, deterministic=True)
-        actions.append(action[0])
-        
-        # Take step in environment
-        obs, reward, done, info = env.step(action)
+        if using_vec:
+            actions.append(float(action[0][0]))
+            # VecEnv API
+            obs, rewards, dones, infos = env.step(action)
+            done = bool(dones[0])
+            info = infos[0]
+        else:
+            actions.append(float(action[0]))
+            # Gymnasium API
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = bool(terminated) or bool(truncated)
         
         # Record results
         portfolio_values.append(info['balance'])
@@ -170,9 +196,22 @@ def create_comparison_plots(agent_results, benchmark_results, test_data, save_pa
     
     agent_values, agent_returns, agent_allocations, agent_actions = agent_results
     benchmark_values, benchmark_returns, benchmark_allocations = benchmark_results
-    
-    # Create date index
-    dates = test_data['Date'].iloc[:len(agent_values)]
+
+    # Base dates from full test data
+    dates_full = test_data['Date']
+
+    # Align portfolio value series and dates to common length
+    min_len_values = min(len(agent_values), len(benchmark_values), len(dates_full))
+    agent_values = agent_values[:min_len_values]
+    benchmark_values = benchmark_values[:min_len_values]
+    dates_values = dates_full.iloc[:min_len_values]
+
+    # Align returns and dates used for returns plots
+    min_len_rets = min(len(agent_returns), len(benchmark_returns))
+    agent_returns = agent_returns[:min_len_rets]
+    benchmark_returns = benchmark_returns[:min_len_rets]
+    # Dates for returns correspond to changes between days, shift by one
+    dates_rets = dates_values[1:1 + min_len_rets]
     
     # Set up the plotting style
     plt.style.use('default')
@@ -183,8 +222,8 @@ def create_comparison_plots(agent_results, benchmark_results, test_data, save_pa
     fig.suptitle('RL Trading Agent vs Buy-and-Hold Benchmark', fontsize=16, fontweight='bold')
     
     # 1. Portfolio Value Comparison
-    axes[0, 0].plot(dates, agent_values, label='RL Agent', linewidth=2, color='blue')
-    axes[0, 0].plot(dates, benchmark_values, label='Buy & Hold SPY', linewidth=2, color='red')
+    axes[0, 0].plot(dates_values, agent_values, label='RL Agent', linewidth=2, color='blue')
+    axes[0, 0].plot(dates_values, benchmark_values, label='Buy & Hold SPY', linewidth=2, color='red')
     axes[0, 0].set_title('Portfolio Value Over Time')
     axes[0, 0].set_xlabel('Date')
     axes[0, 0].set_ylabel('Portfolio Value ($)')
@@ -195,9 +234,9 @@ def create_comparison_plots(agent_results, benchmark_results, test_data, save_pa
     # 2. Cumulative Returns
     agent_cumret = np.cumprod(1 + np.array(agent_returns))
     benchmark_cumret = np.cumprod(1 + np.array(benchmark_returns))
-    
-    axes[0, 1].plot(dates[1:], agent_cumret, label='RL Agent', linewidth=2, color='blue')
-    axes[0, 1].plot(dates[1:], benchmark_cumret, label='Buy & Hold SPY', linewidth=2, color='red')
+
+    axes[0, 1].plot(dates_rets, agent_cumret, label='RL Agent', linewidth=2, color='blue')
+    axes[0, 1].plot(dates_rets, benchmark_cumret, label='Buy & Hold SPY', linewidth=2, color='red')
     axes[0, 1].set_title('Cumulative Returns')
     axes[0, 1].set_xlabel('Date')
     axes[0, 1].set_ylabel('Cumulative Return')
@@ -208,9 +247,13 @@ def create_comparison_plots(agent_results, benchmark_results, test_data, save_pa
     # 3. Asset Allocation Over Time
     spy_allocations = [alloc[0] for alloc in agent_allocations]
     gld_allocations = [alloc[1] for alloc in agent_allocations]
-    
-    axes[1, 0].fill_between(dates, 0, spy_allocations, alpha=0.7, label='SPY Allocation', color='blue')
-    axes[1, 0].fill_between(dates, spy_allocations, np.array(spy_allocations) + np.array(gld_allocations), 
+    alloc_len = min(len(spy_allocations), len(dates_values))
+    spy_allocations = np.array(spy_allocations[:alloc_len])
+    gld_allocations = np.array(gld_allocations[:alloc_len])
+    dates_alloc = dates_values.iloc[:alloc_len]
+
+    axes[1, 0].fill_between(dates_alloc, 0, spy_allocations, alpha=0.7, label='SPY Allocation', color='blue')
+    axes[1, 0].fill_between(dates_alloc, spy_allocations, spy_allocations + gld_allocations,
                            alpha=0.7, label='GLD Allocation', color='gold')
     axes[1, 0].set_title('Asset Allocation Over Time')
     axes[1, 0].set_xlabel('Date')
@@ -224,18 +267,18 @@ def create_comparison_plots(agent_results, benchmark_results, test_data, save_pa
     window = 60  # 60-day rolling window
     agent_rolling_sharpe = []
     benchmark_rolling_sharpe = []
-    
-    for i in range(window, len(agent_returns)):
-        agent_window = agent_returns[i-window:i]
-        benchmark_window = benchmark_returns[i-window:i]
-        
-        agent_sharpe = np.mean(agent_window) / np.std(agent_window) * np.sqrt(252) if np.std(agent_window) > 0 else 0
-        benchmark_sharpe = np.mean(benchmark_window) / np.std(benchmark_window) * np.sqrt(252) if np.std(benchmark_window) > 0 else 0
-        
+
+    for end_idx in range(window - 1, len(agent_returns)):
+        agent_window = agent_returns[end_idx - window + 1:end_idx + 1]
+        benchmark_window = benchmark_returns[end_idx - window + 1:end_idx + 1]
+
+        agent_sharpe = (np.mean(agent_window) / np.std(agent_window) * np.sqrt(252)) if np.std(agent_window) > 0 else 0
+        benchmark_sharpe = (np.mean(benchmark_window) / np.std(benchmark_window) * np.sqrt(252)) if np.std(benchmark_window) > 0 else 0
+
         agent_rolling_sharpe.append(agent_sharpe)
         benchmark_rolling_sharpe.append(benchmark_sharpe)
-    
-    rolling_dates = dates[window+1:len(agent_rolling_sharpe)+window+1]
+
+    rolling_dates = dates_rets[window - 1: window - 1 + len(agent_rolling_sharpe)]
     axes[1, 1].plot(rolling_dates, agent_rolling_sharpe, label='RL Agent', linewidth=2, color='blue')
     axes[1, 1].plot(rolling_dates, benchmark_rolling_sharpe, label='Buy & Hold SPY', linewidth=2, color='red')
     axes[1, 1].set_title(f'{window}-Day Rolling Sharpe Ratio')
@@ -266,10 +309,23 @@ def print_performance_summary(agent_results, benchmark_results):
     
     agent_values, agent_returns, _, _ = agent_results
     benchmark_values, benchmark_returns, _ = benchmark_results
-    
+
+    # Derive returns from portfolio value series for consistent metrics
+    def values_to_returns(values):
+        values = np.array(values, dtype=float)
+        if len(values) < 2:
+            return []
+        return (values[1:] - values[:-1]) / values[:-1]
+
+    agent_ret_for_metrics = values_to_returns(agent_values)
+    bench_ret_for_metrics = values_to_returns(benchmark_values)
+    common_len = min(len(agent_ret_for_metrics), len(bench_ret_for_metrics))
+    agent_ret_for_metrics = agent_ret_for_metrics[:common_len]
+    bench_ret_for_metrics = bench_ret_for_metrics[:common_len]
+
     # Calculate metrics
-    agent_analyzer = PortfolioAnalyzer(agent_returns)
-    benchmark_analyzer = PortfolioAnalyzer(benchmark_returns)
+    agent_analyzer = PortfolioAnalyzer(agent_ret_for_metrics)
+    benchmark_analyzer = PortfolioAnalyzer(bench_ret_for_metrics)
     
     agent_metrics = agent_analyzer.calculate_metrics()
     benchmark_metrics = benchmark_analyzer.calculate_metrics()
