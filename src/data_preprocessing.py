@@ -1,179 +1,131 @@
-"""
-Data Preprocessing Script for RL Trading Agent
-Processes raw stock data and calculates technical indicators
-"""
-
-import pandas as pd
-import numpy as np
-import pandas_ta as ta
 import os
-from sklearn.preprocessing import StandardScaler
+import pandas as pd
+import pandas_ta as ta
+import yfinance as yf
+from sklearn.model_selection import train_test_split
 
-def calculate_technical_indicators(df, ticker_col='Ticker'):
-    """
-    Calculate technical indicators for stock data
-    
-    Args:
-        df (pd.DataFrame): Stock data with OHLCV columns
-        ticker_col (str): Name of ticker column
-    
-    Returns:
-        pd.DataFrame: DataFrame with technical indicators added
-    """
-    
-    processed_data = []
-    
-    for ticker in df[ticker_col].unique():
-        ticker_data = df[df[ticker_col] == ticker].copy()
-        ticker_data = ticker_data.sort_values('Date').reset_index(drop=True)
-        
-        print(f"Processing technical indicators for {ticker}...")
-        
-        # Calculate returns
-        ticker_data['Returns'] = ticker_data['Close'].pct_change()
-        ticker_data['Log_Returns'] = np.log(ticker_data['Close'] / ticker_data['Close'].shift(1))
-        
-        # Moving averages
-        ticker_data['SMA_10'] = ticker_data['Close'].rolling(window=10).mean()
-        ticker_data['SMA_30'] = ticker_data['Close'].rolling(window=30).mean()
-        ticker_data['EMA_10'] = ticker_data['Close'].ewm(span=10).mean()
-        ticker_data['EMA_30'] = ticker_data['Close'].ewm(span=30).mean()
-        
-        # MACD
-        macd_data = ta.macd(ticker_data['Close'])
-        ticker_data['MACD'] = macd_data['MACD_12_26_9']
-        ticker_data['MACD_Signal'] = macd_data['MACDs_12_26_9']
-        ticker_data['MACD_Histogram'] = macd_data['MACDh_12_26_9']
-        
-        # RSI
-        ticker_data['RSI'] = ta.rsi(ticker_data['Close'], length=14)
-        
-        # ATR (Average True Range)
-        ticker_data['ATR'] = ta.atr(ticker_data['High'], ticker_data['Low'], ticker_data['Close'], length=14)
-        
-        # Bollinger Bands
-        bb_data = ta.bbands(ticker_data['Close'], length=20)
-        ticker_data['BB_Upper'] = bb_data['BBU_20_2.0']
-        ticker_data['BB_Middle'] = bb_data['BBM_20_2.0']
-        ticker_data['BB_Lower'] = bb_data['BBL_20_2.0']
-        ticker_data['BB_Width'] = (ticker_data['BB_Upper'] - ticker_data['BB_Lower']) / ticker_data['BB_Middle']
-        
-        # Volume indicators
-        ticker_data['Volume_SMA'] = ticker_data['Volume'].rolling(window=20).mean()
-        ticker_data['Volume_Ratio'] = ticker_data['Volume'] / ticker_data['Volume_SMA']
-        
-        # Volatility (rolling standard deviation of returns)
-        ticker_data['Volatility'] = ticker_data['Returns'].rolling(window=20).std()
-        
-        processed_data.append(ticker_data)
-    
-    return pd.concat(processed_data, ignore_index=True)
+# --- Configuration ---
+# Define the base path relative to the current script location
+# This ensures that all paths are relative to the project root
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, 'data')
 
-def create_pivot_features(df):
-    """
-    Create pivot table features for multi-asset analysis
-    
-    Args:
-        df (pd.DataFrame): Processed stock data
-    
-    Returns:
-        pd.DataFrame: DataFrame with pivot features
-    """
-    
-    # Select key columns for pivoting
-    pivot_cols = ['Close', 'Returns', 'RSI', 'MACD', 'ATR', 'Volatility']
-    
-    pivot_data = df[['Date', 'Ticker'] + pivot_cols].copy()
-    
-    # Create pivot tables for each feature
-    pivot_features = {}
-    
-    for col in pivot_cols:
-        pivot_table = pivot_data.pivot(index='Date', columns='Ticker', values=col)
-        
-        # Rename columns to include feature name
-        pivot_table.columns = [f'{col}_{ticker}' for ticker in pivot_table.columns]
-        pivot_features[col] = pivot_table
-    
-    # Combine all pivot features
-    combined_pivot = pd.concat(pivot_features.values(), axis=1)
-    combined_pivot.reset_index(inplace=True)
-    
-    return combined_pivot
+# Ensure the data directory exists
+os.makedirs(DATA_DIR, exist_ok=True)
 
-def split_data(df, train_ratio=0.75):
+RAW_DATA_PATH = os.path.join(DATA_DIR, 'raw_data.csv')
+PROCESSED_DATA_PATH = os.path.join(DATA_DIR, 'processed_data.csv')
+TRAIN_DATA_PATH = os.path.join(DATA_DIR, 'train_data.csv')
+TEST_DATA_PATH = os.path.join(DATA_DIR, 'test_data.csv')
+
+def fetch_data(tickers, start_date, end_date):
     """
-    Split data into training and testing sets
-    
+    Fetches historical market data for the given tickers from Yahoo Finance.
+
     Args:
-        df (pd.DataFrame): Processed data
-        train_ratio (float): Ratio of data to use for training
-    
+        tickers (list): A list of ticker symbols.
+        start_date (str): The start date for the data in 'YYYY-MM-DD' format.
+        end_date (str): The end date for the data in 'YYYY-MM-DD' format.
+
     Returns:
-        tuple: (train_data, test_data)
+        pd.DataFrame: A DataFrame containing the raw OHLCV data.
     """
+    print(f"Fetching data for {tickers} from {start_date} to {end_date}...")
+    try:
+        data = yf.download(tickers, start=start_date, end=end_date)
+        # Forward-fill and then back-fill to handle missing values
+        data.ffill(inplace=True)
+        data.bfill(inplace=True)
+        print("Data fetching complete.")
+        return data
+    except Exception as e:
+        print(f"An error occurred during data fetching: {e}")
+        return pd.DataFrame()
+
+def engineer_features(raw_data, primary_ticker='SPY', secondary_ticker='GLD'):
+    """
+    Engineers technical indicators and relational features from the raw data.
+
+    Args:
+        raw_data (pd.DataFrame): The raw OHLCV data.
+        primary_ticker (str): The primary asset ticker.
+        secondary_ticker (str): The secondary asset ticker.
+
+    Returns:
+        pd.DataFrame: A DataFrame with engineered features.
+    """
+    print("Engineering features...")
+    df = pd.DataFrame()
     
-    df_sorted = df.sort_values('Date').reset_index(drop=True)
-    split_idx = int(len(df_sorted) * train_ratio)
+    # Isolate columns for each ticker
+    spy_cols = {col: f"{col}_{primary_ticker}" for col in ['Open', 'High', 'Low', 'Close', 'Volume']}
+    gld_cols = {col: f"{col}_{secondary_ticker}" for col in ['Open', 'High', 'Low', 'Close', 'Volume']}
+
+    df_spy = raw_data['Close'][[primary_ticker]].rename(columns={primary_ticker: f'Close_{primary_ticker}'})
+    df_gld = raw_data['Close'][[secondary_ticker]].rename(columns={secondary_ticker: f'Close_{secondary_ticker}'})
     
-    train_data = df_sorted[:split_idx].copy()
-    test_data = df_sorted[split_idx:].copy()
+    # Combine close prices into a single DataFrame
+    df = pd.concat([df_spy, df_gld], axis=1)
+
+    # Calculate returns for both assets
+    df[f'Return_{primary_ticker}'] = df[f'Close_{primary_ticker}'].pct_change()
+    df[f'Return_{secondary_ticker}'] = df[f'Close_{secondary_ticker}'].pct_change()
+
+    # --- Technical Indicators using pandas-ta ---
+    # SPY indicators
+    df.ta.rsi(close=df[f'Close_{primary_ticker}'], length=14, append=True, col_names=(f'RSI_{primary_ticker}',))
+    df.ta.macd(close=df[f'Close_{primary_ticker}'], length=12, append=True, col_names=(f'MACD_{primary_ticker}', f'MACDh_{primary_ticker}', f'MACDs_{primary_ticker}'))
     
-    print(f"Training data: {len(train_data)} records ({train_data['Date'].min()} to {train_data['Date'].max()})")
-    print(f"Testing data: {len(test_data)} records ({test_data['Date'].min()} to {test_data['Date'].max()})")
+    # GLD indicators
+    df.ta.rsi(close=df[f'Close_{secondary_ticker}'], length=14, append=True, col_names=(f'RSI_{secondary_ticker}',))
+    df.ta.macd(close=df[f'Close_{secondary_ticker}'], length=12, append=True, col_names=(f'MACD_{secondary_ticker}', f'MACDh_{secondary_ticker}', f'MACDs_{secondary_ticker}'))
+
+    # Relational feature: Price Ratio
+    df['Price_Ratio_SPY_GLD'] = df[f'Close_{primary_ticker}'] / df[f'Close_{secondary_ticker}']
+
+    # Clean up by dropping initial rows with NaN values from indicator calculations
+    df.dropna(inplace=True)
     
-    return train_data, test_data
+    print("Feature engineering complete.")
+    return df
 
 def main():
-    """Main preprocessing function"""
+    """Main data preprocessing pipeline."""
+    print("=== Data Preprocessing Pipeline ===")
     
-    # Load raw data
-    raw_data_path = '../data/raw_data.csv'
+    # 1. Fetch Data
+    raw_data = fetch_data(tickers=['SPY', 'GLD'], start_date='2005-01-01', end_date='2022-12-31')
     
-    if not os.path.exists(raw_data_path):
-        print(f"Raw data file not found: {raw_data_path}")
-        print("Please run data_collection.py first")
-        return False
+    if raw_data.empty:
+        print("Halting pipeline due to data fetching failure.")
+        return
+
+    # Save the raw data for reference
+    raw_data.to_csv(RAW_DATA_PATH)
+    print(f"Raw data saved to {RAW_DATA_PATH}")
+
+    # 2. Engineer Features
+    processed_df = engineer_features(raw_data)
+
+    # Save fully processed data
+    processed_df.to_csv(PROCESSED_DATA_PATH)
+    print(f"Processed data with all features saved to {PROCESSED_DATA_PATH}")
+
+    # 3. Split Data into Training and Testing sets
+    # Using a standard 80/20 split
+    train_df, test_df = train_test_split(processed_df, test_size=0.2, shuffle=False)
     
-    print("Loading raw data...")
-    raw_data = pd.read_csv(raw_data_path)
-    raw_data['Date'] = pd.to_datetime(raw_data['Date'])
-    
-    print(f"Loaded {len(raw_data)} records")
-    
-    # Calculate technical indicators
-    print("\nCalculating technical indicators...")
-    processed_data = calculate_technical_indicators(raw_data)
-    
-    # Create pivot features for multi-asset analysis
-    print("\nCreating pivot features...")
-    pivot_data = create_pivot_features(processed_data)
-    
-    # Remove rows with NaN values (due to technical indicators)
-    print(f"Data shape before cleaning: {pivot_data.shape}")
-    pivot_data = pivot_data.dropna()
-    print(f"Data shape after cleaning: {pivot_data.shape}")
-    
-    # Split into training and testing sets
-    print("\nSplitting data...")
-    train_data, test_data = split_data(pivot_data)
-    
-    # Save processed data
-    print("\nSaving processed data...")
-    pivot_data.to_csv('../data/processed_data.csv', index=False)
-    train_data.to_csv('../data/train_data.csv', index=False)
-    test_data.to_csv('../data/test_data.csv', index=False)
-    
-    print("Data preprocessing completed successfully!")
-    
-    # Display summary statistics
-    print("\nSummary Statistics:")
-    print(f"Total processed records: {len(pivot_data)}")
-    print(f"Training records: {len(train_data)}")
-    print(f"Testing records: {len(test_data)}")
-    print(f"Features: {pivot_data.shape[1]}")
-    
-    return True
+    # Save the split datasets
+    train_df.to_csv(TRAIN_DATA_PATH)
+    test_df.to_csv(TEST_DATA_PATH)
+
+    print("\n--- Pipeline Summary ---")
+    print(f"Total records processed: {len(processed_df)}")
+    print(f"Training data shape: {train_df.shape} (from {train_df.index.min().date()} to {train_df.index.max().date()})")
+    print(f"Testing data shape: {test_df.shape} (from {test_df.index.min().date()} to {test_df.index.max().date()})")
+    print(f"Training data saved to {TRAIN_DATA_PATH}")
+    print(f"Testing data saved to {TEST_DATA_PATH}")
+    print("\n✅ Data preprocessing completed successfully!")
 
 if __name__ == "__main__":
     main()

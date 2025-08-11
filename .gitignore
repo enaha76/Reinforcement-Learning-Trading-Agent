@@ -32,7 +32,7 @@ venv/
 # Project data and artifacts
 # Ignore large or generated files, keep placeholders and docs
 models/
-results/
+data/
 logs/
 runs/
 
